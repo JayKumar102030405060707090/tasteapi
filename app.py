@@ -7,7 +7,9 @@ import httpx
 
 app = FastAPI()
 stream_cache = {}
-API_KEYS = {"your_api_key_here": True}
+
+# --- अपनी API key यहाँ डालो ---
+API_KEYS = {"abc123": True}  # ← अपनी key डालो
 
 class YouTubeAPI:
     def __init__(self):
@@ -43,32 +45,37 @@ class YouTubeAPI:
                 
                 stream_id = str(uuid.uuid4())
                 
-                # ऑडियो/वीडियो स्ट्रीम चुनें
+                # --- Safe stream selection ---
                 if video:
                     actual_url = next(
-                        f['url'] for f in info['formats'] 
-                        if f.get('vcodec') != 'none'
+                        (f['url'] for f in info['formats'] if f.get('vcodec') != 'none' and 'url' in f),
+                        None
                     )
                 else:
                     actual_url = next(
-                        f['url'] for f in info['formats'] 
-                        if f.get('acodec') != 'none' and f.get('vcodec') == 'none'
+                        (f['url'] for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and 'url' in f),
+                        None
                     )
-                
+
+                if not actual_url:
+                    raise HTTPException(status_code=500, detail="No suitable stream found")
+
+                # --- Cache store ---
                 stream_cache[stream_id] = {
                     'url': actual_url,
-                    'expires': time.time() + 3600
+                    'expires': time.time() + 3600  # 1 hour expiry
                 }
                 
                 return {
-                    'id': info['id'],
-                    'title': info['title'],
-                    'duration': info['duration'],
-                    'link': info['webpage_url'],
-                    'thumbnail': info['thumbnail'],
+                    'id': info.get('id'),
+                    'title': info.get('title'),
+                    'duration': info.get('duration'),
+                    'link': info.get('webpage_url'),
+                    'thumbnail': info.get('thumbnail'),
                     'stream_url': f"/stream/{stream_id}",
                     'stream_type': 'Video' if video else 'Audio'
                 }
+
             except Exception as e:
                 print(f"Extraction error: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -115,11 +122,7 @@ async def stream_proxy(
     }
     
     async with httpx.AsyncClient() as client:
-        async with client.stream(
-            'GET',
-            stream_info['url'],
-            headers=headers
-        ) as response:
+        async with client.stream('GET', stream_info['url'], headers=headers) as response:
             return Response(
                 content=response.iter_bytes(),
                 status_code=response.status_code,
