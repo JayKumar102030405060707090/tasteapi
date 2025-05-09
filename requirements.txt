@@ -2,3 +2,4 @@ fastapi
 uvicorn
 yt-dlp
 youtube-search-python
+httpx
