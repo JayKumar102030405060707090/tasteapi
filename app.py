@@ -1,206 +1,132 @@
-# app.py
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import Optional
+import asyncio
+import uuid
+import time
+from fastapi import FastAPI, Request, Response, HTTPException, Query
 import yt_dlp
-from youtubesearchpython import VideosSearch
-import uvicorn
+import httpx
 
-app = FastAPI(title="YouTube API Backend", version="1.0")
+app = FastAPI()
+stream_cache = {}
+API_KEYS = {"your_api_key_here": True}
 
-# Allow all CORS (you can restrict later)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class YouTubeAPI:
+    def __init__(self):
+        self.ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+        }
 
-# Helper: yt-dlp extraction
-def extract_info(url, download=False):
-    ydl_opts = {"quiet": True, "skip_download": not download}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download)
+    async def search_youtube(self, query: str):
+        """yt-dlp का उपयोग करके सर्च करें"""
+        ydl_opts = {
+            'quiet': True,
+            'extract_flat': True,
+            'force_generic_extractor': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = await asyncio.to_thread(ydl.extract_info, f"ytsearch:{query}", download=False)
+                return info['entries'][0]['url']
+            except Exception as e:
+                print(f"Search error: {e}")
+                return None
 
-# 1. /youtube?query=...&video=true/false
+    async def extract_info(self, url: str, video: bool = False):
+        """वीडियो इन्फो एक्सट्रैक्ट करें"""
+        with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+            try:
+                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+                
+                if 'entries' in info:
+                    info = info['entries'][0]
+                
+                stream_id = str(uuid.uuid4())
+                
+                # ऑडियो/वीडियो स्ट्रीम चुनें
+                if video:
+                    actual_url = next(
+                        f['url'] for f in info['formats'] 
+                        if f.get('vcodec') != 'none'
+                    )
+                else:
+                    actual_url = next(
+                        f['url'] for f in info['formats'] 
+                        if f.get('acodec') != 'none' and f.get('vcodec') == 'none'
+                    )
+                
+                stream_cache[stream_id] = {
+                    'url': actual_url,
+                    'expires': time.time() + 3600
+                }
+                
+                return {
+                    'id': info['id'],
+                    'title': info['title'],
+                    'duration': info['duration'],
+                    'link': info['webpage_url'],
+                    'thumbnail': info['thumbnail'],
+                    'stream_url': f"/stream/{stream_id}",
+                    'stream_type': 'Video' if video else 'Audio'
+                }
+            except Exception as e:
+                print(f"Extraction error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+youtube_api = YouTubeAPI()
+
 @app.get("/youtube")
-def youtube_search(query: str, video: bool = False):
-    try:
-        search = VideosSearch(query, limit=10)
-        results = search.result()["result"]
-        filtered = []
-        for item in results:
-            if video and item.get("type") != "video":
-                continue
-            filtered.append({
-                "title": item["title"],
-                "link": item["link"],
-                "duration": item.get("duration"),
-                "thumbnail": item["thumbnails"][0]["url"],
-                "videoId": item["id"]
-            })
-        return {"results": filtered}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+async def youtube_endpoint(
+    query: str = Query(...),
+    video: bool = Query(False),
+    api_key: str = Query(...)
+):
+    if api_key not in API_KEYS:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    if not ("youtube.com" in query or "youtu.be" in query):
+        query = await youtube_api.search_youtube(query)
+        if not query:
+            raise HTTPException(status_code=404, detail="Video not found")
+    
+    return await youtube_api.extract_info(query, video)
 
-# 2. /details?link=...
-@app.get("/details")
-def youtube_details(link: str):
-    try:
-        info = extract_info(link)
-        return {
-            "title": info.get("title"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "videoId": info.get("id")
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 3. /track?link=...
-@app.get("/track")
-def youtube_track(link: str):
-    try:
-        info = extract_info(link)
-        return {
-            "title": info.get("title"),
-            "link": link,
-            "thumbnail": info.get("thumbnail"),
-            "videoId": info.get("id")
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 4. /formats?link=...
-@app.get("/formats")
-def youtube_formats(link: str):
-    try:
-        info = extract_info(link)
-        formats = []
-        for f in info.get("formats", []):
-            formats.append({
-                "format_id": f.get("format_id"),
-                "ext": f.get("ext"),
-                "resolution": f.get("resolution"),
-                "filesize": f.get("filesize"),
-                "format_note": f.get("format_note"),
-                "acodec": f.get("acodec"),
-                "vcodec": f.get("vcodec"),
-                "url": f.get("url")
-            })
-        return {"formats": formats}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 5. /playlist?link=...&limit=...
-@app.get("/playlist")
-def youtube_playlist(link: str, limit: Optional[int] = 100):
-    try:
-        info = extract_info(link)
-        entries = info.get("entries", [])
-        videos = []
-        for idx, entry in enumerate(entries):
-            if idx >= limit:
-                break
-            videos.append({
-                "title": entry.get("title"),
-                "videoId": entry.get("id"),
-                "link": f"https://youtu.be/{entry.get('id')}",
-                "thumbnail": entry.get("thumbnail")
-            })
-        return {"videos": videos}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 6. /download/audio?link=...
-@app.get("/download/audio")
-def download_audio(link: str):
-    try:
-        info = extract_info(link)
-        best_audio = None
-        for f in info['formats']:
-            if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                if not best_audio or (f.get('abr', 0) > best_audio.get('abr', 0)):
-                    best_audio = f
-        if not best_audio:
-            return JSONResponse(status_code=404, content={"error": "No audio format found"})
-        return {"download_url": best_audio['url']}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 7. /download/video?link=...
-@app.get("/download/video")
-def download_video(link: str):
-    try:
-        info = extract_info(link)
-        best_video = info['url'] if 'url' in info else None
-        if best_video:
-            return {"download_url": best_video}
-        # fallback: get best progressive format
-        best = None
-        for f in info['formats']:
-            if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-                if not best or (f.get('height', 0) > best.get('height', 0)):
-                    best = f
-        if not best:
-            return JSONResponse(status_code=404, content={"error": "No video format found"})
-        return {"download_url": best['url']}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 8. /download/custom?link=...&format_id=...&title=...
-@app.get("/download/custom")
-def download_custom(link: str, format_id: str, title: Optional[str] = None):
-    try:
-        info = extract_info(link)
-        target_format = next((f for f in info['formats'] if f['format_id'] == format_id), None)
-        if not target_format:
-            return JSONResponse(status_code=404, content={"error": "Format ID not found"})
-        return {
-            "title": title if title else info.get('title'),
-            "download_url": target_format['url']
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 9. /search?query=...
-@app.get("/search")
-def search_videos(query: str):
-    try:
-        search = VideosSearch(query, limit=10)
-        results = search.result()["result"]
-        data = []
-        for item in results:
-            data.append({
-                "title": item["title"],
-                "link": item["link"],
-                "duration": item.get("duration"),
-                "thumbnail": item["thumbnails"][0]["url"],
-                "videoId": item["id"]
-            })
-        return {"results": data}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# 10. /slider?query=...&index=...
-@app.get("/slider")
-def slider_result(query: str, index: int = 0):
-    try:
-        search = VideosSearch(query, limit=10)
-        results = search.result()["result"]
-        if index < 0 or index >= len(results):
-            return JSONResponse(status_code=400, content={"error": "Invalid index"})
-        item = results[index]
-        return {
-            "title": item["title"],
-            "link": item["link"],
-            "duration": item.get("duration"),
-            "thumbnail": item["thumbnails"][0]["url"],
-            "videoId": item["id"]
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+@app.get("/stream/{stream_id}")
+async def stream_proxy(
+    stream_id: str,
+    request: Request,
+    api_key: str = Query(...)
+):
+    if api_key not in API_KEYS:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    
+    if stream_id not in stream_cache:
+        raise HTTPException(status_code=404, detail="Stream not found")
+    
+    stream_info = stream_cache[stream_id]
+    
+    if time.time() > stream_info['expires']:
+        del stream_cache[stream_id]
+        raise HTTPException(status_code=410, detail="Stream expired")
+    
+    headers = {
+        key: value for key, value in request.headers.items()
+        if key.lower() in ['range', 'accept']
+    }
+    
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            'GET',
+            stream_info['url'],
+            headers=headers
+        ) as response:
+            return Response(
+                content=response.iter_bytes(),
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.headers.get('content-type')
+            )
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=1470)
