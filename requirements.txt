@@ -4,4 +4,4 @@ yt-dlp
 httpx
 aioredis
 slowapi
-youtubesearchpython
+git+https://github.com/alexmercerind/youtube-search-python
